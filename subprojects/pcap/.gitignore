@@ -1,0 +1,79 @@
+#Compiled Object files
+*.slo
+*.lo
+*.o
+
+#Compiled Dynamic libraries
+*.dll
+*.so
+*.dylib
+
+#Compiled Static libraries
+*.lai
+*.la
+*.a
+
+#vim
+*.swp
+*.swo
+
+#pcap and pcapng files
+*.pcap
+*.pcapng
+*.pcapng.zst
+*.pcapng.zstd
+*.cap
+
+#Bin and Obj directories
+**/Bin
+**/Obj
+**/Lib
+**/BinCatcher
+**/BinPitcher
+
+#Distribution folder
+Dist/
+build/
+
+#auto generated files
+setup_dpdk_settings.dat
+3rdParty/OUIDataset/manuf.dat
+
+#curl text
+Tests/Pcap++Test/cUrl/curl_output.txt
+
+#eclipse files
+**/.settings
+
+#Visual studio code
+.cproject
+.project
+.vscode
+.favorites.json
+
+#Visual studio generated files
+*.pdb
+*.ilk
+*.log
+*.obj
+*.idb
+*.tlog
+*.VC.db
+*.vcxproj.user
+**/.vs
+CMakeSettings.json
+
+#Visual Studio Projects
+mk/vs2015/**
+mk/vs2017/**
+mk/vs2019/**
+
+#Tutorial outputs
+Examples/Tutorials/**/*.exe
+
+#venv
+.venv/**
+venv/**
+
+#MacOS system files
+**/.DS_Store

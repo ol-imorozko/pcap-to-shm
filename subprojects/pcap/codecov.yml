@@ -1,0 +1,16 @@
+coverage:
+  status:
+    project:
+      default:
+        threshold: 1%
+    patch: off
+
+codecov:
+  notify:
+    after_n_builds: 16
+    wait_for_ci: yes
+
+ignore:
+  - "3rdParty/*"
+  - "Tests/*"
+  - "Examples/*"

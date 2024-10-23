@@ -1,0 +1,1333 @@
+I want you to help we write a code that will dump packets captured by dpdk into a pcap file,
+but not in a file on disk, but in shared memory in a ring manner, i.e if the next packet will be too
+much, we should loop over and override the first packet.
+
+So, here's my current code that performs dumping in a custom format:
+#include <cstdint>
+
+namespace common
+{
+
+// Each buffer ring has the following structure:
+//
+//                _________memory_to_store_the_packets_______________
+//               |                                                   |
+//               |          __________item_t_________                |
+//               |         |                         |               |
+// [["b","a",...]({}{}{}...{["s","t",...]............}...........{}{})]
+//  |___________|           |___________|____________|
+//      ^                           ^                 \__memory[]
+//      |                           |
+//      |                        item_header_t: "s" -- size
+//      |                                       "t" -- tag
+//   ring_header_t: "b" -- before              ... -- padding
+//                  "a" -- after
+//                  ... -- padding
+class bufferring
+{
+public:
+	bufferring()
+	{
+	}
+	bufferring(void* memory, int unit_size, int units_number) :
+	        unit_size(unit_size),
+	        units_number(units_number)
+	{
+		ring = (ring_t*)memory;
+	}
+
+	struct ring_header_t
+	{
+		uint64_t before;
+		uint64_t after;
+	} __attribute__((__aligned__(64)));
+
+	struct ring_t
+	{
+		ring_header_t header;
+		uint8_t memory[];
+	};
+
+	struct item_header_t
+	{
+		uint32_t size;
+		uint32_t tag;
+		uint32_t in_logicalport_id;
+		uint32_t out_logicalport_id;
+		uint8_t flow_type;
+	} __attribute__((__aligned__(64)));
+
+	struct item_t
+	{
+		item_header_t header;
+		uint8_t memory[];
+	};
+
+	int unit_size;
+	int units_number;
+	ring_t* ring;
+};
+
+}
+
+#pragma once
+
+#include <rte_mbuf.h>
+
+#include "common/bufferring.h"
+#include "common/result.h"
+#include "common/type.h"
+
+#include "config.h"
+
+namespace sharedmemory
+{
+
+using ring_header_t = common::bufferring::ring_header_t;
+using ring_t = common::bufferring::ring_t;
+using item_header_t = common::bufferring::item_header_t;
+using item_t = common::bufferring::item_t;
+using DumpFormat = tDataPlaneConfig::DumpFormat;
+
+class cSharedMemory
+{
+	DumpFormat format_;
+
+public:
+	cSharedMemory() :
+	        format_(DumpFormat::kRaw) {}
+
+	cSharedMemory(DumpFormat format) :
+	        format_(format) {}
+
+	eResult init(void* memory, int unit_size, int units_number);
+	void write(rte_mbuf* mbuf, common::globalBase::eFlowType flow_type);
+
+	common::bufferring buffer;
+};
+
+} // namespace sharedmemory
+
+
+#include "sharedmemory.h"
+#include "common/type.h"
+#include "metadata.h"
+
+using namespace sharedmemory;
+
+eResult cSharedMemory::init(void* memory, int unit_size, int units_number)
+{
+	switch (format_)
+	{
+		case DumpFormat::kPcap:
+			// init somehow with pcaps
+			return eResult::success;
+
+		case DumpFormat::kRaw:
+			buffer = common::bufferring(memory, unit_size, units_number);
+
+			buffer.ring->header.before = 0;
+			buffer.ring->header.after = 0;
+
+			return eResult::success;
+		default:
+			YANET_THROW("Wrong shared memory dump format");
+	}
+}
+
+void cSharedMemory::write(rte_mbuf* mbuf, common::globalBase::eFlowType flow_type)
+{
+	// Each ring has its own header, the header contains absolute position
+	// to which next packet should be written. Position has two state:
+	// -- "before" increments immediately before of copying data to memory;
+	// -- "after" increments after copying data.
+
+	uint64_t wpos = (buffer.ring->header.before) % buffer.units_number;
+	buffer.ring->header.before++;
+	item_t* item = (item_t*)((uintptr_t)buffer.ring->memory + (wpos * buffer.unit_size));
+
+	dataplane::metadata* metadata = YADECAP_METADATA(mbuf);
+
+	uint64_t memory_size = buffer.unit_size - sizeof(ring_header_t);
+	uint64_t copy_size = RTE_MIN(memory_size, mbuf->data_len);
+
+	item->header.size = copy_size;
+	item->header.tag = metadata->hash;
+	item->header.in_logicalport_id = metadata->in_logicalport_id;
+	item->header.out_logicalport_id = metadata->out_logicalport_id;
+	item->header.flow_type = (uint8_t)flow_type;
+
+	memcpy(item->memory,
+	       rte_pktmbuf_mtod(mbuf, void*),
+	       copy_size);
+
+	YANET_MEMORY_BARRIER_COMPILE;
+
+	buffer.ring->header.after++;
+}
+
+
+The class "cSharedMemory" gets initizlized with "format" and the memory being scattered across workers:
+    eResult cDataPlane::splitSharedMemoryPerWorkers()
+{
+	std::map<void*, uint64_t> offsets;
+	for (const auto& it : shm_by_socket_id)
+	{
+		const auto& addr = std::get<1>(it.second);
+		offsets[addr] = 0;
+	}
+
+	/// split memory per worker
+	for (cWorker* worker : workers_vector)
+	{
+		const auto& socket_id = worker->socketId;
+		const auto& it = shm_by_socket_id.find(socket_id);
+		if (it == shm_by_socket_id.end())
+		{
+			continue;
+		}
+
+		const auto& [key, shm] = it->second;
+
+		int ring_id = 0;
+		for (const auto& [tag, ring_cfg] : config.shared_memory)
+		{
+			const auto& [dump_size, units_number, format] = ring_cfg;
+
+			auto unit_size = sizeof(sharedmemory::item_header_t) + dump_size;
+			if (unit_size % RTE_CACHE_LINE_SIZE != 0)
+			{
+				unit_size += RTE_CACHE_LINE_SIZE - unit_size % RTE_CACHE_LINE_SIZE; /// round up
+			}
+
+			auto size = sizeof(sharedmemory::ring_header_t) + unit_size * units_number;
+			if (size % RTE_CACHE_LINE_SIZE != 0)
+			{
+				size += RTE_CACHE_LINE_SIZE - size % RTE_CACHE_LINE_SIZE; /// round up
+			}
+
+			auto name = "shm_" + std::to_string(worker->coreId) + "_" + std::to_string(ring_id);
+
+			auto offset = offsets[shm];
+
+			auto memaddr = (void*)((intptr_t)shm + offset);
+
+			sharedmemory::cSharedMemory ring(format);
+
+			ring.init(memaddr, unit_size, units_number);
+
+			offsets[shm] += size;
+
+			worker->dumpRings[ring_id] = ring;
+
+			auto meta = common::idp::get_shm_info::dump_meta(name, tag, unit_size, units_number, worker->coreId, socket_id, key, offset);
+			dumps_meta.emplace_back(meta);
+
+			tag_to_id[tag] = ring_id;
+
+			ring_id++;
+		}
+	}
+
+	for (cWorker* worker : workers_vector)
+	{
+		const auto& socket_id = worker->socketId;
+		const auto& it = shm_by_socket_id.find(socket_id);
+		if (it == shm_by_socket_id.end())
+		{
+			continue;
+		}
+		const auto& [key, shm] = it->second;
+
+		auto offset = offsets[shm];
+		worker->tsc_deltas = (dataplane::perf::tsc_deltas*)((intptr_t)shm + offset);
+		memset(worker->tsc_deltas, 0, sizeof(dataplane::perf::tsc_deltas));
+		offsets[shm] += sizeof(dataplane::perf::tsc_deltas);
+
+		auto meta = common::idp::get_shm_tsc_info::tsc_meta(worker->coreId, socket_id, key, offset);
+		tscs_meta.emplace_back(meta);
+	}
+
+	return eResult::success;
+}
+
+Then on "dump" step we have the worker and DPDK's mbuf, and we just dump in shared memory like so:
+	static void execute(const common::DumpAction& action, const Flow& flow, const ActionDispatcherArgs& args)
+	{
+		auto ring_id = args.base->globalBase->dump_id_to_tag[action.dump_id];
+		if (ring_id == -1)
+		{
+			return;
+		}
+
+		auto& ring = args.worker->dumpRings[ring_id];
+		ring.write(args.mbuf, flow.type);
+	}
+
+
+
+I need to extend `init` and `write` methods of cSharedMemory class, adding an ability to dump packets in shared memory in a PCAP format with curcular ring approach.
+
+Note that I'm using PcapPlusPlus lib.
+
+You can scan the internet for it's documentation, I'll provide only a small part:
+Part 2: Reading And Writing Pcap Files
+Introduction
+PcapPlusPlus supports 2 packet capture file formats: pcap and pcap-ng. Using an easy-to-use interface you can easily read and write packets from/to those file types
+
+Essentially there are 4 classes and 2 interfaces for that:
+
+PcapFileReaderDevice - read packets from pcap files
+PcapNgFileReaderDevice - read packets from pcap-ng files
+PcapFileWriterDevice - write packets to a pcap file
+PcapNgFileWriterDevice - write packets to a pcap-ng file
+IFileReaderDevice - a reader interface, implemented by both PcapFileReaderDevice and PcapNgFileReaderDevice
+IFileWriterDevice - a writer interface, implemented by both PcapFileWriterDevice and PcapNgFileWriterDevice
+In this tutorial we'll write a simple application that reads and writes packets from/to pcap and pcap-ng file.
+
+Reading and writing packets
+So let's start our application with a "main" method and a single include to "PcapFileDevice.h" which contains all the API for reading and writing packets from/to files
+
+#include <memory>
+#include <iostream>
+#include "stdlib.h"
+#include "PcapFileDevice.h"
+
+/**
+* main method of the application
+*/
+int main(int argc, char* argv[])
+{
+    // write your code here
+}
+
+Next thing would be to open a pcap file for reading. We'll assume we have a pcap file named "input.pcap" and we want to open it for reading. If we know it's a pcap file we can use the pcap reader class PcapFileReaderDevice, and same for pcap-ng files we can use PcapNgFileReaderDevice class.
+
+But PcapPlusPlus also contains an interface class that automatically identifies the file type by its extension and creates an interface instance which both classes implement, so you can use it without really knowing which class hides behind it. This interface is called IFileReaderDevice. Let's use it in our application:
+
+// use the IFileReaderDevice interface to automatically identify file type (pcap/pcap-ng)
+// and create an interface instance that both readers implement
+std::unique_ptr<pcpp::IFileReaderDevice> reader(pcpp::IFileReaderDevice::getReader("input.pcap"));
+
+// verify that a reader interface was indeed created
+if (reader == nullptr)
+{
+    std::cerr << "Cannot determine reader for file type" << std::endl;
+    return 1;
+}
+
+As you can see we used the static method pcpp::IFileReaderDevice::getReader() to create the interface.
+
+Now let's open the reader for reading:
+
+// open the reader for reading
+if (!reader->open())
+{
+    std::cerr << "Cannot open input.pcap for reading" << std::endl;
+    return 1;
+}
+
+Now we are ready to start reading packets from the file. But before we do that let's demonstrate using file writers as well. We'll open 2 file writers: one pcap writer and one pcap-ng writer. We'll write the packets we read from the reader to both writers.
+
+Let's start by creating the pcap writer and open it for writing:
+
+// create a pcap file writer. Specify file name and link type of all packets that
+// will be written to it
+pcpp::PcapFileWriterDevice pcapWriter("output.pcap", pcpp::LINKTYPE_ETHERNET);
+
+// try to open the file for writing
+if (!pcapWriter.open())
+{
+    std::cerr << "Cannot open output.pcap for writing" << std::endl;
+    return 1;
+}
+
+As you can see we need to specify in the constructor the file name ("output.pcap") and the link type of all packets that will be written to it. That's because the pcap file format can contain single link type per file.
+
+Now let's open the second writer that writes pcap-ng files:
+
+// create a pcap-ng file writer. Specify file name. Link type is not necessary because
+// pcap-ng files can store multiple link types in the same file
+pcpp::PcapNgFileWriterDevice pcapNgWriter("output.pcapng");
+
+// try to open the file for writing
+if (!pcapNgWriter.open())
+{
+    std::cerr << "Cannot open output.pcapng for writing" << std::endl;
+    return 1;
+}
+
+You can notice that in this constructor there's no need to specify the link type. That's because pcap-ng files can store multiple link types in the same file.
+
+Another cool feature in file readers is setting a BPF filter so only packets that match the filter will be read and the others will be ignored. Let's set a filter that will catch only packets with source or dest IP of "98.138.19.88":
+
+// set a BPF filter for the reader - only packets that match the filter will be read
+if (!reader->setFilter("net 98.138.19.88"))
+{
+    std::cerr << "Cannot set filter for file reader" << std::endl;
+    return 1;
+}
+
+Now let's start a while loop where we'll read all the packets (that match the BPF filter) and write them to both writers:
+
+// the packet container
+pcpp::RawPacket rawPacket;
+
+// a while loop that will continue as long as there are packets in the input file
+// matching the BPF filter
+while (reader->getNextPacket(rawPacket))
+{
+    // write each packet to both writers
+    pcapWriter.writePacket(rawPacket);
+    pcapNgWriter.writePacket(rawPacket);
+}
+
+We're done reading all packets that match the BPF filter and writing them to both writers.
+
+Another feature I'd like to demonstrate is getting reader/writer statistics. These are basic stats that only count packets that were read/written successfully and those who weren't. Let's get stats from reader and both writers and print them:
+
+// Use lambda to simplify statistics output
+auto printStats = [](const std::string& writerName, const pcpp::IPcapDevice::PcapStats& stats) {
+    std::cout << "Written " << stats.packetsRecv << " packets successfully to " << writerName
+        << " and " << stats.packetsDrop << " packets could not be written" << std::endl;
+};
+
+// create the stats object
+pcpp::IPcapDevice::PcapStats stats;
+
+// read stats from reader and print them
+reader->getStatistics(stats);
+std::cout << "Read " << stats.packetsRecv << " packets successfully and " << stats.packetsDrop << " packets could not be read" << std::endl;
+
+// read stats from pcap writer and print them
+pcapWriter.getStatistics(stats);
+printStats("pcap writer", stats);
+
+// read stats from pcap-ng writer and print them
+pcapNgWriter.getStatistics(stats);
+printStats("pcap-ng writer", stats);
+
+
+We're done reading and writing packets. The only thing left is closing the reader and writers. We also need to free the reader because it was created by the pcpp::IFileReaderDevice::getReader() static method.
+
+// close reader
+reader->close();
+
+// close writers
+pcapWriter.close();
+pcapNgWriter.close();
+
+When running the application with the input.pcap file attached below, here is the output (on Windows):
+
+C:\PcapPlusPlus\Examples\Tutorials\Part2-PcapFiles>Part2-PcapFiles.exe
+Read 10 packets successfully and 0 packets could not be read
+Written 10 packets successfully to pcap writer and 0 packets could not be written
+Written 10 packets successfully to pcap-ng writer and 0 packets could not be written
+
+As you can see 10 packets were read successfully from the reader and written to both writers. Notice the original "input.pcap" file contains 28 packets, the reason not all of them were read is the BPF filter we set: only 10 out of the 28 packets matched the filter.
+
+Appending packets to existing files
+PcapPlusPlus enables appending packets to existing pcap/pcap-ng files. This means that packets that you write won't overwrite the file but will be apppended to the existing packets in the file. This is a unique feature for PcapPlusPlus that is not supported in libpcap/WinPcap and required specific implementation outside of libpcap/WinPcap APIs. If you want to open a file writer in append mode all you need to do it to use the open(bool) method overload and set it to "true", let's see an example:
+
+// try to open the file for writing in append mode
+if (!pcapWriter.open(true))
+{
+    std::cerr << "Cannot open output.pcap for writing in append mode" << std::endl;
+    return 1;
+}
+
+That's it! file is now opened in append mode and will not be overridden.
+
+ * Filter Traffic DPDK example application
+ * =======================================
+ * An application that listens to one or more DPDK ports (a.k.a DPDK devices), captures all traffic
+ * and matches packets by user-defined matching criteria. Matching criteria is given on startup and can contain one or
+ * more of the following: source IP, destination IP, source TCP/UDP port, destination TCP/UDP port and TCP or UDP
+ * protocol. Matching is done per flow, meaning the first packet received on a flow is matched against the matching
+ * criteria and if it's matched then all packets of the same flow will be matched too. Packets that are matched can be
+ * send to a DPDK port and/or be save to a pcap file. In addition the application collect statistics on received and
+ * matched packets: number of packets per protocol, number of matched flows and number of matched packets.
+ *
+ * The application uses the concept of worker threads. Number of cores can be set by the user or set to default (default
+ * is all machine cores minus one management core). Each core is assigned with one worker thread. The application
+ * divides the DPDK ports and RX queues equally between worker threads. For example: if there are 2 DPDK ports to listen
+ * to, each one with 6 RX queues and there are 3 worker threads, then worker #1 will get RX queues 1-4 of port 1, worker
+ * #2 will get RX queues 5-6 of port 1 and RX queues 1-2 of port 2, and worker #3 will get RX queues 3-6 of port 2. Each
+ * worker thread does exactly the same work: receiving packets, collecting packet statistics, matching flows and
+ * sending/saving matched packets
+ *
+ * __Important__: this application (like all applications using DPDK) should be run as 'sudo'
+ */
+
+#include "Common.h"
+#include "PacketMatchingEngine.h"
+#include "AppWorkerThread.h"
+
+#include "DpdkDeviceList.h"
+#include "TcpLayer.h"
+#include "UdpLayer.h"
+#include "SystemUtils.h"
+#include "PcapPlusPlusVersion.h"
+#include "TablePrinter.h"
+
+#include <vector>
+#include <iostream>
+#include <stdlib.h>
+#include <getopt.h>
+#include <string>
+#include <sstream>
+#include <unistd.h>
+
+#define DEFAULT_MBUF_POOL_SIZE 4095
+#define MAX_QUEUES 64
+
+// clang-format off
+static struct option FilterTrafficOptions[] = {
+	{ "dpdk-ports",           required_argument, nullptr, 'd' },
+	{ "send-matched-packets", optional_argument, nullptr, 's' },
+	{ "save-matched-packets", optional_argument, nullptr, 'f' },
+	{ "match-source-ip",      optional_argument, nullptr, 'i' },
+	{ "match-dest-ip",        optional_argument, nullptr, 'I' },
+	{ "match-source-port",    optional_argument, nullptr, 'p' },
+	{ "match-dest-port",      optional_argument, nullptr, 'P' },
+	{ "match-protocol",       optional_argument, nullptr, 'o' },
+	{ "core-mask",            optional_argument, nullptr, 'c' },
+	{ "mbuf-pool-size",       optional_argument, nullptr, 'm' },
+	{ "rx-queues",            optional_argument, nullptr, 'r' },
+	{ "tx-queues",            optional_argument, nullptr, 't' },
+	{ "help",                 optional_argument, nullptr, 'h' },
+	{ "version",              optional_argument, nullptr, 'v' },
+	{ "list",                 optional_argument, nullptr, 'l' },
+	{ nullptr,                0,                 nullptr,  0  }
+};
+// clang-format on
+
+/**
+ * Print application usage
+ */
+void printUsage()
+{
+	std::cout
+	    << std::endl
+	    << "Usage:" << std::endl
+	    << "------" << std::endl
+	    << pcpp::AppName::get()
+	    << " [-hvl] [-s PORT] [-f FILENAME] [-i IPV4_ADDR] [-I IPV4_ADDR] [-p PORT] [-P PORT] [-r PROTOCOL]"
+	    << std::endl
+	    << "                  [-c CORE_MASK] [-m POOL_SIZE] [-r NUM_QUEUES] [-t NUM_QUEUES] -d PORT_1,PORT_3,...,PORT_N"
+	    << std::endl
+	    << std::endl
+	    << "Options:" << std::endl
+	    << std::endl
+	    << "    -h|--help                                  : Displays this help message and exits" << std::endl
+	    << "    -v|--version                               : Displays the current version and exits" << std::endl
+	    << "    -l|--list                                  : Print the list of DPDK ports and exists" << std::endl
+	    << "    -d|--dpdk-ports PORT_1,PORT_3,...,PORT_N   : A comma-separated list of DPDK port numbers to receive"
+	    << std::endl
+	    << "                                                 packets from. To see all available DPDK ports use the -l "
+	       "switch"
+	    << std::endl
+	    << "    -s|--send-matched-packets PORT             : DPDK port to send matched packets to" << std::endl
+	    << "    -f|--save-matched-packets FILEPATH         : Save matched packets to pcap files under FILEPATH. Packets"
+	    << std::endl
+	    << "                                                 matched by core X will be saved under "
+	       "'FILEPATH/CoreX.pcap'"
+	    << std::endl
+	    << "    -i|--match-source-ip      IPV4_ADDR        : Match source IPv4 address" << std::endl
+	    << "    -I|--match-dest-ip        IPV4_ADDR        : Match destination IPv4 address" << std::endl
+	    << "    -p|--match-source-port    PORT             : Match source TCP/UDP port" << std::endl
+	    << "    -P|--match-dest-port      PORT             : Match destination TCP/UDP port" << std::endl
+	    << "    -o|--match-protocol       PROTOCOL         : Match protocol. Valid values are 'TCP' or 'UDP'"
+	    << std::endl
+	    << "    -c|--core-mask            CORE_MASK        : Core mask of cores to use." << std::endl
+	    << "                                                 For example: use 7 (binary 0111) to use cores 0,1,2."
+	    << std::endl
+	    << "                                                 Default is using all cores except management core"
+	    << std::endl
+	    << "    -m|--mbuf-pool-size       POOL_SIZE        : DPDK mBuf pool size to initialize DPDK with." << std::endl
+	    << "                                                 Default value is 4095" << std::endl
+	    << "    -r|--rx-queues            NUM_QUEUES       : Number of RX queues to open. Cannot exceed the max "
+	       "allowed by the NIC or "
+	    << MAX_QUEUES << std::endl
+	    << "                                                 The default is 1" << std::endl
+	    << "    -t|--tx-queues            NUM_QUEUES       : Number of TX queues to open. Cannot exceed the max "
+	       "allowed by the NIC or "
+	    << MAX_QUEUES << std::endl
+	    << "                                                 The default is 1" << std::endl
+	    << std::endl;
+}
+
+/**
+ * Print application version
+ */
+void printAppVersion()
+{
+	std::cout << pcpp::AppName::get() << " " << pcpp::getPcapPlusPlusVersionFull() << std::endl
+	          << "Built: " << pcpp::getBuildDateTime() << std::endl
+	          << "Built from: " << pcpp::getGitInfo() << std::endl;
+	exit(0);
+}
+
+/**
+ * Print to console all available DPDK ports. Used by the -l switch
+ */
+void listDpdkPorts()
+{
+	pcpp::CoreMask coreMaskToUse = pcpp::getCoreMaskForAllMachineCores();
+
+	// initialize DPDK
+	if (!pcpp::DpdkDeviceList::initDpdk(coreMaskToUse, DEFAULT_MBUF_POOL_SIZE))
+	{
+		EXIT_WITH_ERROR("couldn't initialize DPDK");
+	}
+
+	std::cout << "DPDK port list:" << std::endl;
+
+	// go over all available DPDK devices and print info for each one
+	std::vector<pcpp::DpdkDevice*> deviceList = pcpp::DpdkDeviceList::getInstance().getDpdkDeviceList();
+	for (const auto& dev : deviceList)
+	{
+		std::cout << "   "
+		          << " Port #" << dev->getDeviceId() << ":"
+		          << " MAC address='" << dev->getMacAddress() << "';"
+		          << " PCI address='" << dev->getPciAddress() << "';"
+		          << " PMD='" << dev->getPMDName() << "'" << std::endl;
+	}
+}
+
+/**
+ * Prepare the configuration for each core. Configuration includes: which DpdkDevices and which RX queues to receive
+ * packets from, where to send the matched packets, etc.
+ */
+void prepareCoreConfiguration(std::vector<pcpp::DpdkDevice*>& dpdkDevicesToUse,
+                              std::vector<pcpp::SystemCore>& coresToUse, bool writePacketsToDisk,
+                              const std::string& packetFilePath, pcpp::DpdkDevice* sendPacketsTo,
+                              AppWorkerConfig workerConfigArr[], int workerConfigArrLen, uint16_t rxQueues)
+{
+	// create a list of pairs of DpdkDevice and RX queues for all RX queues in all requested devices
+	int totalNumOfRxQueues = 0;
+	std::vector<std::pair<pcpp::DpdkDevice*, int>> deviceAndRxQVec;
+	for (const auto& iter : dpdkDevicesToUse)
+	{
+		for (int rxQueueIndex = 0; rxQueueIndex < rxQueues; rxQueueIndex++)
+		{
+			std::pair<pcpp::DpdkDevice*, int> curPair(iter, rxQueueIndex);
+			deviceAndRxQVec.push_back(curPair);
+		}
+		totalNumOfRxQueues += rxQueues;
+	}
+
+	// calculate how many RX queues each core will read packets from. We divide the total number of RX queues with total
+	// number of core
+	int numOfRxQueuesPerCore = totalNumOfRxQueues / coresToUse.size();
+	int rxQueuesRemainder = totalNumOfRxQueues % coresToUse.size();
+
+	// prepare the configuration for every core: divide the devices and RX queue for each device with the various cores
+	int i = 0;
+	std::vector<std::pair<pcpp::DpdkDevice*, int>>::iterator pairVecIter = deviceAndRxQVec.begin();
+	for (const auto& core : coresToUse)
+	{
+		std::cout << "Using core " << (int)core.Id << std::endl;
+		workerConfigArr[i].coreId = core.Id;
+		workerConfigArr[i].writeMatchedPacketsToFile = writePacketsToDisk;
+
+		std::stringstream packetFileName;
+		packetFileName << packetFilePath << "Core" << workerConfigArr[i].coreId << ".pcap";
+		workerConfigArr[i].pathToWritePackets = packetFileName.str();
+
+		workerConfigArr[i].sendPacketsTo = sendPacketsTo;
+		for (int rxQIndex = 0; rxQIndex < numOfRxQueuesPerCore; rxQIndex++)
+		{
+			if (pairVecIter == deviceAndRxQVec.end())
+				break;
+			workerConfigArr[i].inDataCfg[pairVecIter->first].push_back(pairVecIter->second);
+			++pairVecIter;
+		}
+		if (rxQueuesRemainder > 0 && (pairVecIter != deviceAndRxQVec.end()))
+		{
+			workerConfigArr[i].inDataCfg[pairVecIter->first].push_back(pairVecIter->second);
+			++pairVecIter;
+			rxQueuesRemainder--;
+		}
+
+		// print configuration for core
+		std::cout << "   Core configuration:" << std::endl;
+		for (const auto& iter2 : workerConfigArr[i].inDataCfg)
+		{
+			std::cout << "      DPDK device#" << iter2.first->getDeviceId() << ": ";
+			for (const auto& iter3 : iter2.second)
+			{
+				std::cout << "RX-Queue#" << iter3 << ";  ";
+			}
+			std::cout << std::endl;
+		}
+		if (workerConfigArr[i].inDataCfg.size() == 0)
+		{
+			std::cout << "      None" << std::endl;
+		}
+		i++;
+	}
+}
+
+struct FilterTrafficArgs
+{
+	bool shouldStop;
+	std::vector<pcpp::DpdkWorkerThread*>* workerThreadsVector;
+
+	FilterTrafficArgs() : shouldStop(false), workerThreadsVector(nullptr)
+	{}
+};
+
+/**
+ * Print thread stats in a table
+ */
+void printStats(const PacketStats& threadStats, const std::string& columnName)
+{
+	std::vector<std::string> columnNames = { columnName, "Count" };
+	std::vector<int> columnsWidths = { 21, 10 };
+	pcpp::TablePrinter printer(columnNames, columnsWidths);
+
+	printer.printRow("Eth count|" + std::to_string(threadStats.ethCount), '|');
+	printer.printRow("ARP count|" + std::to_string(threadStats.arpCount), '|');
+	printer.printRow("IPv4 count|" + std::to_string(threadStats.ipv4Count), '|');
+	printer.printRow("IPv6 count|" + std::to_string(threadStats.ipv6Count), '|');
+	printer.printRow("TCP count|" + std::to_string(threadStats.tcpCount), '|');
+	printer.printRow("UDP count|" + std::to_string(threadStats.udpCount), '|');
+	printer.printRow("HTTP count|" + std::to_string(threadStats.httpCount), '|');
+	printer.printRow("DNS count|" + std::to_string(threadStats.dnsCount), '|');
+	printer.printRow("TLS count|" + std::to_string(threadStats.tlsCount), '|');
+	printer.printSeparator();
+	printer.printRow("Matched TCP flows|" + std::to_string(threadStats.matchedTcpFlows), '|');
+	printer.printRow("Matched UDP flows|" + std::to_string(threadStats.matchedUdpFlows), '|');
+	printer.printSeparator();
+	printer.printRow("Matched packet count|" + std::to_string(threadStats.matchedPackets), '|');
+	printer.printRow("Total packet count|" + std::to_string(threadStats.packetCount), '|');
+}
+
+/**
+ * The callback to be called when application is terminated by ctrl-c. Do cleanup and print summary stats
+ */
+void onApplicationInterrupted(void* cookie)
+{
+	FilterTrafficArgs* args = (FilterTrafficArgs*)cookie;
+
+	std::cout << std::endl << std::endl << "Application stopped" << std::endl;
+
+	// stop worker threads
+	pcpp::DpdkDeviceList::getInstance().stopDpdkWorkerThreads();
+
+	// print final stats for every worker thread plus sum of all threads and free worker threads memory
+	PacketStats aggregatedStats;
+	std::vector<PacketStats> threadStatsVec;
+	for (const auto& iter : *(args->workerThreadsVector))
+	{
+		AppWorkerThread* thread = (AppWorkerThread*)(iter);
+		PacketStats threadStats = thread->getStats();
+		aggregatedStats.collectStats(threadStats);
+		threadStatsVec.push_back(threadStats);
+		delete thread;
+	}
+
+	// print stats for every worker threads
+	for (auto threadStats : threadStatsVec)
+	{
+		// no need to print table if no packets were received
+		if (threadStats.packetCount == 0)
+		{
+			std::cout << "Core #" << std::to_string(threadStats.workerId) << " - no packets received" << std::endl;
+			continue;
+		}
+
+		printStats(threadStats, "Core #" + std::to_string(threadStats.workerId) + " Stat");
+		std::cout << std::endl;
+	}
+
+	// print aggregated stats if packets were received
+	if (aggregatedStats.packetCount != 0)
+	{
+		printStats(aggregatedStats, "Aggregated Stats");
+	}
+
+	args->shouldStop = true;
+}
+
+/**
+ * main method of the application. Responsible for parsing user args, preparing worker thread configuration, creating
+ * the worker threads and activate them. At program termination worker threads are stopped, statistics are collected
+ * from them and printed to console
+ */
+int main(int argc, char* argv[])
+{
+	pcpp::AppName::init(argc, argv);
+
+	std::vector<int> dpdkPortVec;
+
+	bool writePacketsToDisk = false;
+
+	std::string packetFilePath = "";
+
+	pcpp::CoreMask coreMaskToUse = pcpp::getCoreMaskForAllMachineCores();
+
+	int sendPacketsToPort = -1;
+
+	int optionIndex = 0;
+	int opt;
+
+	uint32_t mBufPoolSize = DEFAULT_MBUF_POOL_SIZE;
+
+	pcpp::IPv4Address srcIPToMatch = pcpp::IPv4Address::Zero;
+	pcpp::IPv4Address dstIPToMatch = pcpp::IPv4Address::Zero;
+	uint16_t srcPortToMatch = 0;
+	uint16_t dstPortToMatch = 0;
+	pcpp::ProtocolType protocolToMatch = pcpp::UnknownProtocol;
+
+	uint16_t rxQueues = 1;
+	uint16_t txQueues = 1;
+
+	while ((opt = getopt_long(argc, argv, "d:c:s:f:m:i:I:p:P:o:r:t:hvl", FilterTrafficOptions, &optionIndex)) != -1)
+	{
+		switch (opt)
+		{
+		case 0:
+		{
+			break;
+		}
+		case 'd':
+		{
+			std::string portListAsString = std::string(optarg);
+			std::stringstream stream(portListAsString);
+			std::string portAsString;
+			int port;
+			// break comma-separated string into string list
+			while (getline(stream, portAsString, ','))
+			{
+				char c;
+				std::stringstream stream2(portAsString);
+				stream2 >> port;
+				if (stream2.fail() || stream2.get(c))
+				{
+					// not an integer
+					EXIT_WITH_ERROR_AND_PRINT_USAGE("DPDK ports list is invalid");
+				}
+				dpdkPortVec.push_back(port);
+			}
+
+			// verify list is not empty
+			if (dpdkPortVec.empty())
+			{
+				EXIT_WITH_ERROR_AND_PRINT_USAGE("DPDK ports list is empty");
+			}
+			break;
+		}
+		case 's':
+		{
+			sendPacketsToPort = atoi(optarg);
+			break;
+		}
+		case 'c':
+		{
+			coreMaskToUse = atoi(optarg);
+			break;
+		}
+		case 'f':
+		{
+			packetFilePath = std::string(optarg);
+			writePacketsToDisk = true;
+			if (packetFilePath.empty())
+			{
+				EXIT_WITH_ERROR_AND_PRINT_USAGE("Filename to write packets is empty");
+			}
+			break;
+		}
+		case 'm':
+		{
+			mBufPoolSize = atoi(optarg);
+			break;
+		}
+		case 'i':
+		{
+			try
+			{
+				srcIPToMatch = pcpp::IPv4Address(optarg);
+			}
+			catch (const std::exception&)
+			{
+				EXIT_WITH_ERROR_AND_PRINT_USAGE("Source IP to match isn't a valid IP address");
+			}
+			break;
+		}
+		case 'I':
+		{
+			try
+			{
+				dstIPToMatch = pcpp::IPv4Address(optarg);
+			}
+			catch (const std::exception&)
+			{
+				EXIT_WITH_ERROR_AND_PRINT_USAGE("Destination IP to match isn't a valid IP address");
+			}
+			break;
+		}
+		case 'p':
+		{
+			int ret = atoi(optarg);
+			if (ret <= 0 || ret > 65535)
+			{
+				EXIT_WITH_ERROR_AND_PRINT_USAGE("Source port to match isn't a valid TCP/UDP port");
+			}
+			srcPortToMatch = ret;
+			break;
+		}
+		case 'P':
+		{
+			int ret = atoi(optarg);
+			if (ret <= 0 || ret > 65535)
+			{
+				EXIT_WITH_ERROR_AND_PRINT_USAGE("Destination port to match isn't a valid TCP/UDP port");
+			}
+			dstPortToMatch = ret;
+			break;
+		}
+		case 'o':
+		{
+			std::string protocol = std::string(optarg);
+			if (protocol == "TCP")
+				protocolToMatch = pcpp::TCP;
+			else if (protocol == "UDP")
+				protocolToMatch = pcpp::UDP;
+			else
+			{
+				EXIT_WITH_ERROR_AND_PRINT_USAGE("Protocol to match isn't TCP or UDP");
+			}
+			break;
+		}
+		case 'r':
+		{
+			rxQueues = atoi(optarg);
+			if (rxQueues == 0)
+			{
+				EXIT_WITH_ERROR("Cannot open the device with 0 RX queues");
+			}
+			if (rxQueues > MAX_QUEUES)
+			{
+				EXIT_WITH_ERROR("The number of RX queues cannot exceed " << MAX_QUEUES);
+			}
+			break;
+		}
+		case 't':
+		{
+			txQueues = atoi(optarg);
+			if (txQueues == 0)
+			{
+				EXIT_WITH_ERROR("Cannot open the device with 0 TX queues");
+			}
+			if (txQueues > MAX_QUEUES)
+			{
+				EXIT_WITH_ERROR("The number of TX queues cannot exceed " << MAX_QUEUES);
+			}
+			break;
+		}
+		case 'h':
+		{
+			printUsage();
+			exit(0);
+		}
+		case 'v':
+		{
+			printAppVersion();
+			break;
+		}
+		case 'l':
+		{
+			listDpdkPorts();
+			exit(0);
+		}
+		default:
+		{
+			printUsage();
+			exit(0);
+		}
+		}
+	}
+
+	// verify list is not empty
+	if (dpdkPortVec.empty())
+	{
+		EXIT_WITH_ERROR_AND_PRINT_USAGE("DPDK ports list is empty. Please use the -d switch");
+	}
+
+	// extract core vector from core mask
+	std::vector<pcpp::SystemCore> coresToUse;
+	pcpp::createCoreVectorFromCoreMask(coreMaskToUse, coresToUse);
+
+	// need minimum of 2 cores to start - 1 management core + 1 (or more) worker thread(s)
+	if (coresToUse.size() < 2)
+	{
+		EXIT_WITH_ERROR("Needed minimum of 2 cores to start the application");
+	}
+
+	// initialize DPDK
+	if (!pcpp::DpdkDeviceList::initDpdk(coreMaskToUse, mBufPoolSize))
+	{
+		EXIT_WITH_ERROR("Couldn't initialize DPDK");
+	}
+
+	// removing DPDK master core from core mask because DPDK worker threads cannot run on master core
+	coreMaskToUse = coreMaskToUse & ~(pcpp::DpdkDeviceList::getInstance().getDpdkMasterCore().Mask);
+
+	// re-calculate cores to use after removing master core
+	coresToUse.clear();
+	createCoreVectorFromCoreMask(coreMaskToUse, coresToUse);
+
+	// collect the list of DPDK devices
+	std::vector<pcpp::DpdkDevice*> dpdkDevicesToUse;
+	for (const auto& port : dpdkPortVec)
+	{
+		pcpp::DpdkDevice* dev = pcpp::DpdkDeviceList::getInstance().getDeviceByPort(port);
+		if (dev == nullptr)
+		{
+			EXIT_WITH_ERROR("DPDK device for port " << port << " doesn't exist");
+		}
+		dpdkDevicesToUse.push_back(dev);
+	}
+
+	// go over all devices and open them
+	for (const auto& dev : dpdkDevicesToUse)
+	{
+		if (rxQueues > dev->getTotalNumOfRxQueues())
+		{
+			EXIT_WITH_ERROR("Number of RX errors cannot exceed the max allowed by the device which is "
+			                << dev->getTotalNumOfRxQueues());
+		}
+		if (txQueues > dev->getTotalNumOfTxQueues())
+		{
+			EXIT_WITH_ERROR("Number of TX errors cannot exceed the max allowed by the device which is "
+			                << dev->getTotalNumOfTxQueues());
+		}
+		if (!dev->openMultiQueues(rxQueues, txQueues))
+		{
+			EXIT_WITH_ERROR("Couldn't open DPDK device #" << dev->getDeviceId() << ", PMD '" << dev->getPMDName()
+			                                              << "'");
+		}
+		std::cout << "Opened device #" << dev->getDeviceId() << " with " << rxQueues << " RX queues and " << txQueues
+		          << " TX queues."
+		          << " RSS hash functions:" << std::endl;
+		std::vector<std::string> rssHashFunctions =
+		    dev->rssHashFunctionMaskToString(dev->getConfiguredRssHashFunction());
+		for (const auto& hashFunc : rssHashFunctions)
+		{
+			std::cout << "   " << hashFunc << std::endl;
+		}
+	}
+
+	// get DPDK device to send packets to (or nullptr if doesn't exist)
+	pcpp::DpdkDevice* sendPacketsTo = pcpp::DpdkDeviceList::getInstance().getDeviceByPort(sendPacketsToPort);
+	if (sendPacketsTo != nullptr && !sendPacketsTo->isOpened() && !sendPacketsTo->open())
+	{
+		EXIT_WITH_ERROR("Could not open port#" << sendPacketsToPort << " for sending matched packets");
+	}
+
+	// prepare configuration for every core
+	AppWorkerConfig workerConfigArr[coresToUse.size()];
+	prepareCoreConfiguration(dpdkDevicesToUse, coresToUse, writePacketsToDisk, packetFilePath, sendPacketsTo,
+	                         workerConfigArr, coresToUse.size(), rxQueues);
+
+	PacketMatchingEngine matchingEngine(srcIPToMatch, dstIPToMatch, srcPortToMatch, dstPortToMatch, protocolToMatch);
+
+	// create worker thread for every core
+	std::vector<pcpp::DpdkWorkerThread*> workerThreadVec;
+	int i = 0;
+	for (auto iter = coresToUse.begin(); iter != coresToUse.end(); ++iter)
+	{
+		AppWorkerThread* newWorker = new AppWorkerThread(workerConfigArr[i], matchingEngine);
+		workerThreadVec.push_back(newWorker);
+		i++;
+	}
+
+	// start all worker threads
+	if (!pcpp::DpdkDeviceList::getInstance().startDpdkWorkerThreads(coreMaskToUse, workerThreadVec))
+	{
+		EXIT_WITH_ERROR("Couldn't start worker threads");
+	}
+
+	// register the on app close event to print summary stats on app termination
+	FilterTrafficArgs args;
+	args.workerThreadsVector = &workerThreadVec;
+	pcpp::ApplicationEventHandler::getInstance().onApplicationInterrupted(onApplicationInterrupted, &args);
+
+	// infinite loop (until program is terminated)
+	while (!args.shouldStop)
+	{
+		sleep(5);
+	}
+}
+
+
+PLEASE note that in my code I already have dpdk and all realted things set up, I just get the already created struct rte_mbuf.
+
+Maybe what we need is to publically inherit from the following class in PcapPlusPlus to being able to call setMBuf in a constructor of a new class?:
+#pragma once
+
+// GCOVR_EXCL_START
+
+#include <time.h>
+#include "Packet.h"
+#include "PointerVector.h"
+
+struct rte_mbuf;
+struct rte_mempool;
+
+/**
+ * \namespace pcpp
+ * \brief The main namespace for the PcapPlusPlus lib
+ */
+namespace pcpp
+{
+
+	class DpdkDevice;
+#ifdef USE_DPDK_KNI
+	class KniDevice;
+#endif
+
+#define MBUFRAWPACKET_OBJECT_TYPE 1
+
+	/**
+	 * @class MBufRawPacket
+	 * A class that inherits RawPacket and wraps DPDK's mbuf object (see some info about mbuf in DpdkDevice.h) but is
+	 * compatible with PcapPlusPlus framework. Using MBufRawPacket is be almost similar to using RawPacket, the
+	 * implementation differences are encapsulated in the class implementation. For example: user can create and
+	 * manipulate a Packet object from MBufRawPacket the same way it is done with RawPacket; User can use
+	 * PcapFileWriterDevice to save MBufRawPacket to pcap the same way it's used with RawPacket; etc.<BR> The main
+	 * difference is that RawPacket contains a pointer to the data itself and MBufRawPacket is holding a pointer to an
+	 * mbuf object which contains a pointer to the data. This implies that MBufRawPacket without an mbuf allocated to it
+	 * is not usable. Getting instances of MBufRawPacket can be done in one to the following ways:
+	 *    - Receiving packets from DpdkDevice. In this case DpdkDevice takes care of getting the mbuf from DPDK and
+	 *      wrapping it with MBufRawPacket
+	 *    - Creating MBufRawPacket from scratch (in order to send it with DpdkDevice, for example). In this case the
+	 *      user should call the init() method after constructing the object in order to allocate a new mbuf from DPDK
+	 *      port pool (encapsulated by DpdkDevice)
+	 *
+	 * Limitations of this class:
+	 *    - Currently chained mbufs are not supported. An mbuf has the capability to be linked to another mbuf and
+	 *      create a linked list of mbufs. This is good for Jumbo packets or other uses. MBufRawPacket doesn't support
+	 *      this capability so there is no way to access the mbufs linked to the mbuf wrapped by MBufRawPacket instance.
+	 *      I hope I'll be able to add this support in the future
+	 */
+	class MBufRawPacket : public RawPacket
+	{
+		friend class DpdkDevice;
+#ifdef USE_DPDK_KNI
+		friend class KniDevice;
+#endif
+
+	protected:
+		struct rte_mbuf* m_MBuf;
+		struct rte_mempool* m_Mempool;
+		uint16_t m_MbufDataSize;
+		bool m_FreeMbuf;
+
+		void setMBuf(struct rte_mbuf* mBuf, timespec timestamp);
+		bool init(struct rte_mempool* mempool);
+		bool initFromRawPacket(const RawPacket* rawPacket, struct rte_mempool* mempool);
+
+	public:
+		/**
+		 * A default c'tor for this class. Constructs an instance of this class without an mbuf attached to it. In order
+		 * to allocate an mbuf the user should call the init() method. Without calling init() the instance of this class
+		 * is not usable. This c'tor can be used for initializing an array of MBufRawPacket (which requires an empty
+		 * c'tor)
+		 */
+		MBufRawPacket() : RawPacket(), m_MBuf(nullptr), m_Mempool(nullptr), m_MbufDataSize(0), m_FreeMbuf(true)
+		{
+			m_DeleteRawDataAtDestructor = false;
+		}
+
+		/**
+		 * A d'tor for this class. Once called it frees the mbuf attached to it (returning it back to the mbuf pool it
+		 * was allocated from)
+		 */
+		virtual ~MBufRawPacket();
+
+		/**
+		 * A copy c'tor for this class. The copy c'tor allocates a new mbuf from the same pool the original mbuf was
+		 * allocated from, attaches the new mbuf to this instance of MBufRawPacket and copies the data from the original
+		 * mbuf to the new mbuf
+		 * @param[in] other The MBufRawPacket instance to copy from
+		 */
+		MBufRawPacket(const MBufRawPacket& other);
+
+		/**
+		 * @brief Initialize an instance of this class from DpdkDevice.
+		 * Initialization includes allocating an mbuf from the pool that resides in DpdkDevice.
+		 * The user should call this method only once per instance.
+		 * Calling it more than once will result with an error
+		 * @param[in] device The DpdkDevice which has the pool to allocate the mbuf from
+		 * @return True if initialization succeeded and false if this method was already called for this instance (and
+		 * an mbuf is already attached) or if allocating an mbuf from the pool failed for some reason
+		 */
+		bool init(DpdkDevice* device);
+
+#ifdef USE_DPDK_KNI
+		/**
+		 * @brief Initialize an instance of this class from KniDevice.
+		 * Initialization includes allocating an mbuf from the pool that resides in KniDevice.
+		 * The user should call this method only once per instance.
+		 * Calling it more than once will result with an error
+		 * @param[in] device The KniDevice which has the pool to allocate the mbuf from
+		 * @return True if initialization succeeded and false if this method was already called for this instance (and
+		 * an mbuf is already attached) or if allocating an mbuf from the pool failed for some reason
+		 */
+		bool init(KniDevice* device);
+#endif
+
+		/**
+		 * @brief Initialize an instance of this class and copies the content of a RawPacket object.
+		 * Initialization includes allocating an mbuf from the pool that resides in provided DpdkDevice,
+		 * and copying the data from the input RawPacket object into this mBuf.
+		 * The user should call this method only once per instance.
+		 * Calling it more than once will result with an error
+		 * @param[in] rawPacket A pointer to a RawPacket object from which data will be copied
+		 * @param[in] device The DpdkDevice which has the pool to allocate the mbuf from
+		 * @return True if initialization succeeded and false if this method was already called for this instance (and
+		 * an mbuf is already attached) or if allocating an mbuf from the pool failed for some reason
+		 */
+		bool initFromRawPacket(const RawPacket* rawPacket, DpdkDevice* device);
+
+#ifdef USE_DPDK_KNI
+		/**
+		 * @brief Initialize an instance of this class and copies the content of a RawPacket object.
+		 * Initialization includes allocating an mbuf from the pool that resides in provided KniDevice,
+		 * and copying the data from the input RawPacket object into this mBuf.
+		 * The user should call this method only once per instance.
+		 * Calling it more than once will result with an error
+		 * @param[in] rawPacket A pointer to a RawPacket object from which data will be copied
+		 * @param[in] device The KniDevice which has the pool to allocate the mbuf from
+		 * @return True if initialization succeeded and false if this method was already called for this instance (and
+		 * an mbuf is already attached) or if allocating an mbuf from the pool failed for some reason
+		 */
+		bool initFromRawPacket(const RawPacket* rawPacket, KniDevice* device);
+#endif
+
+		/**
+		 * @return A pointer to the DPDK mbuf stored in this object
+		 */
+		inline rte_mbuf* getMBuf()
+		{
+			return m_MBuf;
+		}
+
+		// overridden methods
+
+		/**
+		 * @return MBufRawPacket object type
+		 */
+		inline uint8_t getObjectType() const override
+		{
+			return MBUFRAWPACKET_OBJECT_TYPE;
+		}
+
+		/**
+		 * An assignment operator for this class. Copies the data from the mbuf attached to the other MBufRawPacket to
+		 * the mbuf attached to this instance. If instance is not initialized (meaning no mbuf is attached) nothing will
+		 * be copied and instance will remain uninitialized (also, an error will be printed)
+		 * @param[in] other The MBufRawPacket to assign data from
+		 */
+		MBufRawPacket& operator=(const MBufRawPacket& other);
+
+		/**
+		 * @brief Clone this MBufRawPacket object. See copy constructor for details.
+		 * The caller is responsible for the deallocation of the returned pointer.
+		 * @return A pointer to the new MBufRawPacket object which is a clone of this object
+		 */
+		MBufRawPacket* clone() const override;
+
+		/**
+		 * Set raw data to the mbuf by copying the data to it. In order to stay compatible with the ancestor method
+		 * which takes control of the data pointer and frees it when RawPacket is destroyed, this method frees this
+		 * pointer right away after data is copied to the mbuf. So when using this method please notice that after it's
+		 * called pRawData memory is free, don't use this pointer again. In addition, if raw packet isn't initialized
+		 * (mbuf is nullptr), this method will call the init() method
+		 * @param[in] pRawData A pointer to the new raw data
+		 * @param[in] rawDataLen The new raw data length in bytes
+		 * @param[in] timestamp The timestamp packet was received by the NIC
+		 * @param[in] layerType The link layer type for this raw data. Default is Ethernet
+		 * @param[in] frameLength When reading from pcap files, sometimes the captured length is different from the
+		 * actual packet length. This parameter represents the packet length. This parameter is optional, if not set or
+		 * set to -1 it is assumed both lengths are equal
+		 * @return True if raw data was copied to the mbuf successfully, false if rawDataLen is larger than mbuf max
+		 * size, if initialization failed or if copying the data to the mbuf failed. In all of these cases an error will
+		 * be printed to log
+		 */
+		bool setRawData(const uint8_t* pRawData, int rawDataLen, timespec timestamp,
+		                LinkLayerType layerType = LINKTYPE_ETHERNET, int frameLength = -1);
+
+		/**
+		 * Clears the object and frees the mbuf
+		 */
+		void clear();
+
+		/**
+		 * Append packet data at the end of current data. This method uses the same mbuf already allocated and tries to
+		 * append more space and copy the data to it. If MBufRawPacket is not initialize (mbuf is nullptr) or mbuf
+		 * append failed an error is printed to log
+		 * @param[in] dataToAppend A pointer to the data to append
+		 * @param[in] dataToAppendLen Length in bytes of dataToAppend
+		 */
+		void appendData(const uint8_t* dataToAppend, size_t dataToAppendLen);
+
+		/**
+		 * Insert raw data at some index of the current data and shift the remaining data to the end. This method uses
+		 * the same mbuf already allocated and tries to append more space to it. Then it just copies dataToAppend at the
+		 * relevant index and shifts the remaining data to the end. If MBufRawPacket is not initialize (mbuf is nullptr)
+		 * or mbuf append failed an error is printed to log
+		 * @param[in] atIndex The index to insert the new data to
+		 * @param[in] dataToInsert A pointer to the new data to insert
+		 * @param[in] dataToInsertLen Length in bytes of dataToInsert
+		 */
+		void insertData(int atIndex, const uint8_t* dataToInsert, size_t dataToInsertLen);
+
+		/**
+		 * Remove certain number of bytes from current raw data buffer. All data after the removed bytes will be shifted
+		 * back. This method uses the mbuf already allocated and tries to trim space from it
+		 * @param[in] atIndex The index to start removing bytes from
+		 * @param[in] numOfBytesToRemove Number of bytes to remove
+		 * @return True if all bytes were removed successfully, or false if MBufRawPacket is not initialize (mbuf is
+		 * nullptr), mbuf trim failed or logatIndex+numOfBytesToRemove is out-of-bounds of the raw data buffer. In all
+		 * of these cases an error is printed to log
+		 */
+		bool removeData(int atIndex, size_t numOfBytesToRemove);
+
+		/**
+		 * This overridden method,in contrast to its ancestor RawPacket#reallocateData() doesn't need to do anything
+		 * because mbuf is already allocated to its maximum extent. So it only performs a check to verify the size after
+		 * re-allocation doesn't exceed mbuf max size
+		 * @param[in] newBufferLength The new buffer length as required by the user
+		 * @return True if new size is larger than current size but smaller than mbuf max size, false otherwise
+		 */
+		bool reallocateData(size_t newBufferLength);
+
+		/**
+		 * Set an indication whether to free the mbuf when done using it or not ("done using it" means setting another
+		 * mbuf or class d'tor). Default value is true.
+		 * @param[in] val The value to set. True means free the mbuf when done using it. Default it True
+		 */
+		inline void setFreeMbuf(bool val = true)
+		{
+			m_FreeMbuf = val;
+		}
+	};
+
+	/**
+	 * @typedef MBufRawPacketVector
+	 * A vector of pointers to MBufRawPacket
+	 */
+	typedef PointerVector<MBufRawPacket> MBufRawPacketVector;
+
+}  // namespace pcpp
+
+// GCOVR_EXCL_STOP
+
+We can get time with
+timespec time;
+clock_gettime(CLOCK_REALTIME, &time);
+
