@@ -14,6 +14,7 @@
 #include <unistd.h>
 
 #include "shared_memory.h"
+#include "shm_device.h"
 
 std::string Hexdump(std::string_view data) {
     std::ostringstream oss;
@@ -86,14 +87,44 @@ int main(int argc, char *argv[]) {
             return 1;
         }
 
+        /* pcpp::PcapFileWriterDevice pcap_writer("output.pcap", pcpp::LINKTYPE_ETHERNET); */
+        pcpp::PcapShmWriterDevice shm_writer(shm.Get(), shm.Size());
+        // Ok, now I need custom writer that will get not a filename, but a shared memory region.
+        // There it will write pcaps and stop once the limit has been reached.
+        // Done.
+        //
+        // After that, let's split shared memory into segments one for each file, and create a class
+        // that will manage wiriging to shared memory ensuring that we will loop over.
+
+        size_t total_bytes_written = 0;
+
+        // try to open the file for writing
+        if (!shm_writer.open()) {
+            std::cerr << "Cannot open output.pcap for writing" << std::endl;
+            return 1;
+        }
+
+        total_bytes_written += pcpp::PcapShmWriterDevice::kGlobalPcapHeaderSize;
+
         // Read and print packets
         pcpp::RawPacket raw_packet;
         while (reader->getNextPacket(raw_packet)) {
             pcpp::Packet parsed_packet(&raw_packet);
             std::cout << parsed_packet.toString() << std::endl;
+            shm_writer.WritePacket(raw_packet);
+            std::cout << "Wrote packet to shared memory" << std::endl;
+            shm_writer.Flush();
+            total_bytes_written +=
+                    pcpp::PcapShmWriterDevice::kPacketPcapHeaderSize + raw_packet.getRawDataLen();
+            std::string_view data_view(reinterpret_cast<char const *>(shm.Get()),
+                                       total_bytes_written);
+            std::string dump = Hexdump(data_view);
+            std::cout << "Hexdump of shared memory content:" << std::endl;
+            std::cout << dump << std::endl;
         }
 
         reader->close();
+        shm_writer.close();
     } catch (std::system_error const &e) {
         std::cerr << "System error: " << e.what() << std::endl;
         return 1;
