@@ -1,29 +1,31 @@
-// IShmDevice.h
-
 #pragma once
 
+#include <array>  // For std::array
+#include <iostream>
 #include <pcap/pcap.h>
 
-#include "Logger.h"
 #include "PcapDevice.h"
 #include "PcapFileDevice.h"
 
+#define TMP_LOG(message)                   \
+    do {                                   \
+        std::cerr << message << std::endl; \
+    } while (0)
+
 namespace pcpp {
+
 /**
  * @class IShmDevice
  * An abstract class representing a shared memory device.
- * This class is abstract and cannot be instantiated.
  */
 class IShmDevice : public IPcapDevice {
 protected:
-    void* m_ShmPtr_;
+    void *m_ShmPtr_;
     size_t m_ShmSize_;
 
-    explicit IShmDevice(void* shmPtr, size_t shmSize)
+    explicit IShmDevice(void *shmPtr, size_t shmSize)
         : IPcapDevice(), m_ShmPtr_(shmPtr), m_ShmSize_(shmSize) {}
 
-    // Pure virtual destructor, we don't have a specific close method
-    // due to shared memory being managed by other means
     virtual ~IShmDevice() {
         close();
     }
@@ -32,7 +34,7 @@ public:
     /**
      * @return The pointer to the shared memory region.
      */
-    void* GetShmPtr() const {
+    void *GetShmPtr() const {
         return m_ShmPtr_;
     }
 
@@ -46,9 +48,7 @@ public:
     void close() {
         if (m_PcapDescriptor != nullptr) {
             m_PcapDescriptor = nullptr;
-            // FIXME:
-            PCPP_LOG(pcpp::Logger::Debug, "Successfully closed file reader device for shared memory '"
-                           << "0xTMP,ADDLOGGING" << "'");
+            // Additional cleanup if needed
         }
 
         m_DeviceOpened = false;
@@ -64,13 +64,10 @@ protected:
     uint32_t m_NumOfPacketsWritten_;
     uint32_t m_NumOfPacketsNotWritten_;
 
-    IShmWriterDevice(void* shmPtr, size_t shmSize)
+    IShmWriterDevice(void *shmPtr, size_t shmSize)
         : IShmDevice(shmPtr, shmSize), m_NumOfPacketsWritten_(0), m_NumOfPacketsNotWritten_(0) {}
 
 public:
-    static constexpr size_t kGlobalPcapHeaderSize = 24;
-    static constexpr size_t kPacketPcapHeaderSize = 16;
-
     virtual ~IShmWriterDevice() {}
 
     /**
@@ -78,50 +75,57 @@ public:
      * @param[in] packet The packet to write.
      * @return True on success, false otherwise.
      */
-    virtual bool WritePacket(RawPacket const& packet) = 0;
+    virtual bool WritePacket(RawPacket const &packet) = 0;
 
     /**
      * Write multiple raw packets to shared memory.
      * @param[in] packets Vector of packets to write.
      * @return True on success, false otherwise.
      */
-    virtual bool WritePackets(RawPacketVector const& packets) = 0;
-
-    // We don't need an open() method since shared memory is provided externally
+    virtual bool WritePackets(RawPacketVector const &packets) = 0;
 };
 
 /**
  * @class PcapShmWriterDevice
  * A class for writing packets to a shared memory region in pcap format.
- * Utilizes libpcap functions and writes to shared memory via a FILE* stream obtained from fmemopen.
  */
 class PcapShmWriterDevice : public IShmWriterDevice {
 private:
-    size_t m_CurrentOffset_;  // Current write offset in the shared memory
+    static constexpr size_t kMaxPcapFiles = 10;         // Maximum number of pcap files (segments)
+    size_t m_PcapFiles_;                                // Actual number of pcap files
+    size_t m_SegmentSize_;                              // Size of each segment
+    std::array<void *, kMaxPcapFiles> m_SegmentPtrs_;   // Pointers to each segment
+    std::array<size_t, kMaxPcapFiles> m_SegmentSizes_;  // Sizes of data written in each segment
+    size_t m_CurrentSegment_;                           // Index of current segment
     LinkLayerType m_LinkLayerType_;
     FileTimestampPrecision m_Precision_;
-    pcap_dumper_t* m_PcapDumpHandler_;
-    FILE* m_File_;
+    pcap_dumper_t *m_PcapDumpHandler_;  // Current pcap dumper
+    FILE *m_File_;                      // Current FILE* stream
 
     // Private copy constructor and assignment operator
-    PcapShmWriterDevice(PcapShmWriterDevice const& other);
-    PcapShmWriterDevice& operator=(PcapShmWriterDevice const& other);
+    PcapShmWriterDevice(PcapShmWriterDevice const &other) = delete;
+    PcapShmWriterDevice &operator=(PcapShmWriterDevice const &other) = delete;
 
 public:
     /**
      * Constructor
      * @param[in] shmPtr Pointer to the shared memory region.
      * @param[in] shmSize Size of the shared memory region.
+     * @param[in] pcapFiles Number of pcap files (segments).
      * @param[in] linkLayerType The link layer type all packets in this region will be based on. The
      * default is Ethernet.
      * @param[in] nanosecondsPrecision A boolean indicating whether to write timestamps in
      * nano-precision. If set to false, timestamps will be written in micro-precision.
      */
-    PcapShmWriterDevice(void* shmPtr, size_t shmSize,
+    PcapShmWriterDevice(void *shmPtr, size_t shmSize, size_t pcapFiles,
                         LinkLayerType linkLayerType = LINKTYPE_ETHERNET,
                         bool nanosecondsPrecision = false)
         : IShmWriterDevice(shmPtr, shmSize),
-          m_CurrentOffset_(0),
+          m_PcapFiles_(pcapFiles),
+          m_SegmentSize_(0),
+          m_SegmentPtrs_(),
+          m_SegmentSizes_(),
+          m_CurrentSegment_(0),
           m_LinkLayerType_(linkLayerType),
           m_PcapDumpHandler_(nullptr),
           m_File_(nullptr) {
@@ -130,15 +134,16 @@ public:
                                             : FileTimestampPrecision::Microseconds;
 #else
         if (nanosecondsPrecision) {
-            PCPP_LOG_ERROR(
-                    "PcapPlusPlus was compiled without nano precision support which requires "
+            TMP_LOG("PcapPlusPlus was compiled without nano precision support which requires "
                     "libpcap > 1.5.1. Please "
                     "recompile PcapPlusPlus with nano precision support to use this feature. Using "
                     "default microsecond precision");
         }
-        m_Precision = FileTimestampPrecision::Microseconds;
+        m_Precision_ = FileTimestampPrecision::Microseconds;
 #endif
-        PCPP_LOG(pcpp::Logger::Debug, "Constructed.");
+        if (m_PcapFiles_ > kMaxPcapFiles) {
+            throw std::invalid_argument("pcapFiles exceeds kMaxPcapFiles");
+        }
     }
 
     /**
@@ -154,15 +159,13 @@ public:
      */
     bool open() override {
         if (m_DeviceOpened) {
-            PCPP_LOG(pcpp::Logger::Debug, "Device already opened. Nothing to do");
             return true;
         }
 
         switch (m_LinkLayerType_) {
             case LINKTYPE_RAW:
             case LINKTYPE_DLT_RAW2:
-                PCPP_LOG_ERROR(
-                        "The only Raw IP link type supported in libpcap/WinPcap/Npcap is "
+                TMP_LOG("The only Raw IP link type supported in libpcap/WinPcap/Npcap is "
                         "LINKTYPE_DLT_RAW1, please use that instead");
                 return false;
             default:
@@ -172,59 +175,64 @@ public:
         m_NumOfPacketsNotWritten_ = 0;
         m_NumOfPacketsWritten_ = 0;
 
+        // Initialize segments
+        m_SegmentSize_ = m_ShmSize_ / m_PcapFiles_;
+        for (size_t i = 0; i < m_PcapFiles_; ++i) {
+            m_SegmentPtrs_[i] = static_cast<char *>(m_ShmPtr_) + i * m_SegmentSize_;
+            m_SegmentSizes_[i] = 0;
+        }
+
+        m_CurrentSegment_ = 0;
+
         // Open pcap descriptor
 #if defined(PCAP_TSTAMP_PRECISION_NANO)
-        auto pcap_descriptor = internal::PcapHandle(pcap_open_dead_with_tstamp_precision(
-                m_LinkLayerType_, PCPP_MAX_PACKET_SIZE, static_cast<int>(m_Precision_)));
+        m_PcapDescriptor = internal::PcapHandle(pcap_open_dead_with_tstamp_precision(
+                m_LinkLayerType_, PCPP_MAX_PACKET_SIZE - 1, static_cast<int>(m_Precision_)));
 #else
-        auto pcap_descriptor =
-                internal::PcapHandle(pcap_open_dead(m_LinkLayerType_, PCPP_MAX_PACKET_SIZE));
+        m_PcapDescriptor =
+                internal::PcapHandle(pcap_open_dead(m_LinkLayerType_, PCPP_MAX_PACKET_SIZE - 1));
 #endif
-        if (pcap_descriptor == nullptr) {
-            PCPP_LOG_ERROR("Error opening pcap descriptor: pcap_open_dead returned nullptr");
+        if (m_PcapDescriptor == nullptr) {
+            TMP_LOG("Error opening pcap descriptor: pcap_open_dead returned nullptr");
             m_DeviceOpened = false;
             return false;
         }
 
-        // Use fmemopen to open shared memory as a FILE*
-        m_File_ = fmemopen(m_ShmPtr_, m_ShmSize_, "wb+");
+        // Open the first segment
+        m_File_ = fmemopen(m_SegmentPtrs_[m_CurrentSegment_], m_SegmentSize_, "wb+");
         if (m_File_ == nullptr) {
-            PCPP_LOG_ERROR("Failed to open shared memory as FILE* using fmemopen");
+            TMP_LOG("Failed to open shared memory as FILE* using fmemopen");
             m_DeviceOpened = false;
             return false;
         }
 
         // Get pcap dump handler using pcap_dump_fopen
-        m_PcapDumpHandler_ = pcap_dump_fopen(pcap_descriptor.get(), m_File_);
+        m_PcapDumpHandler_ = pcap_dump_fopen(m_PcapDescriptor.get(), m_File_);
         if (m_PcapDumpHandler_ == nullptr) {
-            PCPP_LOG_ERROR("Error opening pcap dump handler: pcap_dump_fopen returned nullptr");
+            TMP_LOG("Error opening pcap dump handler: pcap_dump_fopen returned nullptr");
             m_DeviceOpened = false;
             return false;
         }
 
-        m_PcapDescriptor = std::move(pcap_descriptor);
+        // Set initial segment size (pcap global header size)
+        m_SegmentSizes_[m_CurrentSegment_] = sizeof(pcap_file_header);
+
         m_DeviceOpened = true;
-        PCPP_LOG(pcpp::Logger::Debug, "Shared memory writer device opened successfully");
         return true;
     }
 
     /**
-     * Write a RawPacket to the shared memory. Before using this method, please verify the device is
-     * opened using open(). This method won't change the written packet.
-     * @param[in] packet A reference to an existing RawPacket to write to the shared memory.
-     * @return True if the packet was written successfully. False will be returned if the device
-     * isn't opened or if the packet link layer type is different than the one defined for the
-     * device.
+     * Write a RawPacket to the shared memory.
      */
-    bool WritePacket(RawPacket const& packet) override {
+    bool WritePacket(RawPacket const &packet) override {
         if (!m_DeviceOpened) {
-            PCPP_LOG_ERROR("Device not opened");
+            TMP_LOG("Device not opened");
             m_NumOfPacketsNotWritten_++;
             return false;
         }
 
         if (packet.getLinkLayerType() != m_LinkLayerType_) {
-            PCPP_LOG_ERROR("Cannot write a packet with a different link layer type");
+            TMP_LOG("Cannot write a packet with a different link layer type");
             m_NumOfPacketsNotWritten_++;
             return false;
         }
@@ -243,50 +251,68 @@ public:
             pkt_hdr.ts.tv_usec = packet_timestamp.tv_nsec;
         }
 #else
-        TIMESPEC_TO_TIMEVAL(&pktHdr.ts, &packet_timestamp);
+        TIMESPEC_TO_TIMEVAL(&pkt_hdr.ts, &packet_timestamp);
 #endif
 
-        // Before writing, check if there is enough space in the shared memory
-        // Get the current position
-        long current_pos = ftell(m_File_);
-        if (current_pos == -1) {
-            PCPP_LOG_ERROR("Failed to get current position in shared memory stream");
-            m_NumOfPacketsNotWritten_++;
-            return false;
-        }
+        // Define the fixed size of the pcap packet header on disk
+        // The on-disk pcap packet header consists of:
+        // - ts_sec (4 bytes)
+        // - ts_usec or ts_nsec (4 bytes)
+        // - caplen (4 bytes)
+        // - len (4 bytes)
+        // Total: 16 bytes
+        constexpr size_t pcap_packet_header_size_on_disk = 16;
 
-        // Estimate the size needed for this packet
-        size_t estimated_size = sizeof(pcap_pkthdr) + pkt_hdr.caplen;
+        // Estimate the size needed for this packet in the pcap file
+        // Note: We use a fixed size for the packet header as it is written to disk,
+        // which is independent of the in-memory size of `struct pcap_pkthdr`.
+        size_t estimated_size = pcap_packet_header_size_on_disk + pkt_hdr.caplen;
 
-        if (static_cast<size_t>(current_pos) + estimated_size > m_ShmSize_) {
-            PCPP_LOG_ERROR("Shared memory overflow while writing packet");
-            // You can throw an exception or handle it as needed
-            throw std::runtime_error("Shared memory overflow");
-            // Alternatively:
-            // m_NumOfPacketsNotWritten++;
-            // return false;
+        if (m_SegmentSizes_[m_CurrentSegment_] + estimated_size > m_SegmentSize_) {
+            // Close current pcap dumper
+            pcap_dump_close(m_PcapDumpHandler_);  // This will also close m_File_
+
+            // Advance to next segment
+            m_CurrentSegment_ = (m_CurrentSegment_ + 1) % m_PcapFiles_;
+
+            // Reset the segment
+            m_SegmentSizes_[m_CurrentSegment_] = 0;
+
+            // Open new FILE* for the segment
+            m_File_ = fmemopen(m_SegmentPtrs_[m_CurrentSegment_], m_SegmentSize_, "wb+");
+            if (m_File_ == nullptr) {
+                TMP_LOG("Failed to open shared memory as FILE* using fmemopen");
+                m_NumOfPacketsNotWritten_++;
+                return false;
+            }
+
+            // Open new pcap dumper
+            m_PcapDumpHandler_ = pcap_dump_fopen(m_PcapDescriptor.get(), m_File_);
+            if (m_PcapDumpHandler_ == nullptr) {
+                TMP_LOG("Error opening pcap dump handler: pcap_dump_fopen returned nullptr");
+                m_NumOfPacketsNotWritten_++;
+                return false;
+            }
+
+            // The pcap global header will be written again
+            m_SegmentSizes_[m_CurrentSegment_] = sizeof(pcap_file_header);
         }
 
         // Write the packet using libpcap's pcap_dump
-        pcap_dump((uint8_t*)m_PcapDumpHandler_, &pkt_hdr, packet.getRawData());
+        pcap_dump((uint8_t *)m_PcapDumpHandler_, &pkt_hdr, packet.getRawData());
+
+        // Update segment size
+        m_SegmentSizes_[m_CurrentSegment_] += estimated_size;
 
         m_NumOfPacketsWritten_++;
-        PCPP_LOG(pcpp::Logger::Debug, "Packet written successfully to shared memory");
         return true;
     }
 
     /**
-     * Write multiple RawPackets to the shared memory. Before using this method, please verify the
-     * device is opened using open(). This method won't change the written packets or the
-     * RawPacketVector instance.
-     * @param[in] packets A reference to an existing RawPacketVector; all of its packets will be
-     * written to the shared memory.
-     * @return True if all packets were written successfully to the shared memory. False will be
-     * returned if the device isn't opened or if at least one of the packets wasn't written
-     * successfully to the shared memory.
+     * Write multiple RawPackets to the shared memory.
      */
-    bool WritePackets(RawPacketVector const& packets) override {
-        for (RawPacket const* packet : packets) {
+    bool WritePackets(RawPacketVector const &packets) override {
+        for (RawPacket const *packet : packets) {
             if (!WritePacket(*packet)) return false;
         }
 
@@ -300,11 +326,11 @@ public:
         if (!m_DeviceOpened) return;
 
         if (pcap_dump_flush(m_PcapDumpHandler_) == -1) {
-            PCPP_LOG_ERROR("Error while flushing the packets to shared memory");
+            TMP_LOG("Error while flushing the packets to shared memory");
         }
 
         if (fflush(m_File_) == EOF) {
-            PCPP_LOG_ERROR("Error while flushing the packets to file");
+            TMP_LOG("Error while flushing the packets to file");
         }
     }
 
@@ -316,26 +342,39 @@ public:
 
         Flush();
 
-        // Maybe this should clear shared memory fully? Idk.
-        IShmDevice::close();
-
+        // Close current pcap dumper
         if (m_PcapDumpHandler_ != nullptr) {
-            pcap_dump_close(m_PcapDumpHandler_);  // closes m_File_ too
+            pcap_dump_close(m_PcapDumpHandler_);  // Closes m_File_ too
+            m_PcapDumpHandler_ = nullptr;
         }
 
-        m_PcapDumpHandler_ = nullptr;
-        PCPP_LOG(pcpp::Logger::Debug, "Shared memory writer device closed");
+        m_PcapDescriptor = nullptr;
+        m_DeviceOpened = false;
     }
 
     /**
      * Get statistics of packets written so far.
-     * @param[out] stats The stats struct where stats are returned.
      */
-    void getStatistics(PcapStats& stats) const override {
+    void getStatistics(PcapStats &stats) const override {
         stats.packetsRecv = m_NumOfPacketsWritten_;
         stats.packetsDrop = m_NumOfPacketsNotWritten_;
         stats.packetsDropByInterface = 0;
-        PCPP_LOG(pcpp::Logger::Debug, "Statistics retrieved for shared memory writer device");
+    }
+
+    /**
+     * Get the pointer to a specific segment.
+     */
+    void *GetSegmentPtr(size_t index) const {
+        if (index >= m_PcapFiles_) return nullptr;
+        return m_SegmentPtrs_[index];
+    }
+
+    /**
+     * Get the size of data written in a specific segment.
+     */
+    size_t GetSegmentSize(size_t index) const {
+        if (index >= m_PcapFiles_) return 0;
+        return m_SegmentSizes_[index];
     }
 };
 
