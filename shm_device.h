@@ -161,7 +161,7 @@ public:
 
         m_SegmentSize_ = m_ShmSize_ / m_PcapFiles_;
 
-        //TODO: we should add this assert
+        // TODO: we should add this assert
         /* if (m_SegmentSize <= 24 + PCPP_MAX_PACKET_SIZE - 1) { */
         /*     TMP_LOG("Segment too small to hold at least one full packet"); */
         /*     throw("something"); */
@@ -178,9 +178,13 @@ public:
     void DumpPcapFilesToDisk(std::string const &filenamePrefix) {
         // Ensure all data is flushed to memory
         Flush();
+        size_t file_index = 1;  // Logical file index, starting from 1 for output
 
         for (size_t i = 0; i < m_PcapFiles_; ++i) {
-            FILE *f = m_Files_[i];
+            // Start printing from (m_CurrentFileIndex_ + 1) % m_PcapFiles_ and loop around
+            size_t segment_index = (m_CurrentFileIndex_ + 1 + i) % m_PcapFiles_;
+            FILE *f = m_Files_[segment_index];
+
             if (f == nullptr) {
                 // If file is already closed or not opened, skip
                 continue;
@@ -200,7 +204,7 @@ public:
 
             size_t used_size = static_cast<size_t>(current_pos);
 
-            std::string filename = filenamePrefix + std::to_string(i + 1) + ".pcap";
+            std::string filename = filenamePrefix + std::to_string(file_index++) + ".pcap";
             std::ofstream output_file(filename, std::ios::binary);
             if (!output_file) {
                 TMP_LOG("Failed to open " << filename << " for writing");
@@ -208,7 +212,8 @@ public:
             }
 
             // Write exactly 'usedSize' bytes from the segment to the file
-            output_file.write(reinterpret_cast<char *>(m_Segments_[i].startPtr), used_size);
+            output_file.write(reinterpret_cast<char *>(m_Segments_[segment_index].startPtr),
+                              used_size);
             if (output_file.bad()) {
                 TMP_LOG("Error writing to file " << filename);
                 continue;
