@@ -161,6 +161,7 @@ public:
 
         m_SegmentSize_ = m_ShmSize_ / m_PcapFiles_;
 
+        //TODO: we should add this assert
         /* if (m_SegmentSize <= 24 + PCPP_MAX_PACKET_SIZE - 1) { */
         /*     TMP_LOG("Segment too small to hold at least one full packet"); */
         /*     throw("something"); */
