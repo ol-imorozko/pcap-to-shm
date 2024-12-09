@@ -6,11 +6,9 @@
 #include <cstring>
 #include <fcntl.h>
 #include <filesystem>
-#include <fstream>  // Added for file operations
-#include <iomanip>
+#include <fstream>
 #include <iostream>
 #include <memory>
-#include <sstream>
 #include <string_view>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -18,46 +16,6 @@
 
 #include "shared_memory.h"
 #include "shm_device.h"
-
-// Hexdump function remains the same
-std::string Hexdump(std::string_view data) {
-    // ... [Function implementation remains unchanged]
-    std::ostringstream oss;
-    oss << std::hex << std::setfill('0');
-
-    size_t const size = data.size();
-
-    for (size_t offset = 0; offset < size; offset += 16) {
-        oss << std::setw(8) << offset << "  ";
-
-        std::string ascii_representation;
-        ascii_representation.reserve(16);
-
-        size_t const line_size = std::min(size - offset, size_t(16));
-
-        for (size_t i = 0; i < 16; ++i) {
-            if (i == 8) {
-                oss << "  ";
-            } else if (i != 0) {
-                oss << ' ';
-            }
-
-            if (i < line_size) {
-                auto const byte = static_cast<unsigned char>(data[offset + i]);
-                oss << std::setw(2) << static_cast<int>(byte);
-
-                ascii_representation += std::isprint(byte) ? byte : '.';
-            } else {
-                oss << "  ";
-                ascii_representation += ' ';
-            }
-        }
-
-        oss << "  |" << ascii_representation << "|\n";
-    }
-
-    return oss.str();
-}
 
 int main(int argc, char *argv[]) {
     // Ensure the program receives exactly two arguments: <pcap_file> and <iteration_number>
@@ -114,17 +72,6 @@ int main(int argc, char *argv[]) {
     try {
         SharedMemory shm(shm_name, shm_size);
 
-        // Write "hello world" to shared memory (optional)
-        /* constexpr std::string_view message = "hello world"; */
-        /* std::memcpy(shm.Get(), message.data(), message.size()); */
-
-        // Hexdump the written content (optional)
-        /* std::string_view data_view(reinterpret_cast<char const *>(shm.Get()), message.size()); */
-        /* std::string dump = Hexdump(data_view); */
-
-        /* std::cout << "Hexdump of shared memory content:" << std::endl; */
-        /* std::cout << dump << std::endl; */
-
         // Open the pcap file using PcapPlusPlus's IFileReaderDevice
         std::unique_ptr<pcpp::IFileReaderDevice> reader(
                 pcpp::IFileReaderDevice::getReader(std::string(pcap_file_name)));
@@ -173,15 +120,11 @@ int main(int argc, char *argv[]) {
                 csv_file << "pcap," << iteration_number << "," << packet_number << ","
                          << duration_ns << "\n";
 
-                /* std::cout << "Wrote packet to shared memory in " << duration_ns << " ns" */
-                /*           << std::endl; */
             } else {
                 std::cerr << "Failed to write packet to shared memory" << std::endl;
                 // Optionally, log this event in the CSV as well with a special time value (e.g.,
                 // -1)
                 csv_file << "pcap," << iteration_number << "," << (packet_number + 1) << ",-1\n";
-                // Assuming m_NumOfPacketsNotWritten_ is accessible here
-                // m_NumOfPacketsNotWritten_++;
             }
         }
 
