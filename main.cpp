@@ -165,8 +165,8 @@ int main(int argc, char *argv[]) {
                 packet_number++;
 
                 // Calculate the duration of WritePacket execution in microseconds
-                auto duration_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                           write_end - write_start)
+                auto duration_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(write_end -
+                                                                                        write_start)
                                            .count();
 
                 // Log the result to the CSV file in the format: format, iteration, packet, time_us
@@ -186,22 +186,7 @@ int main(int argc, char *argv[]) {
         }
 
         // After processing, write the pcap files from shared memory
-        shm_writer.Flush();
-
-        for (size_t i = 0; i < pcap_files; ++i) {
-            size_t segment_size = shm_writer.GetSegmentSize(i);
-            if (segment_size > sizeof(pcap_file_header)) {  // Ensure segment has data beyond header
-                std::string filename = "capture_" + std::to_string(i + 1) + ".pcap";
-                std::ofstream output_file(filename, std::ios::binary);
-                if (!output_file) {
-                    std::cerr << "Failed to open " << filename << " for writing" << std::endl;
-                    continue;
-                }
-                output_file.write(reinterpret_cast<char *>(shm_writer.GetSegmentPtr(i)),
-                                  segment_size);
-                std::cout << "Wrote " << segment_size << " bytes to " << filename << std::endl;
-            }
-        }
+        shm_writer.DumpPcapFilesToDisk("capture_");
 
         // Close the CSV file
         csv_file.close();
@@ -218,4 +203,3 @@ int main(int argc, char *argv[]) {
 
     return 0;
 }
-
